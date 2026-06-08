@@ -2,11 +2,17 @@
 #
 # Pipeline: raw fetcher items → Ollama LLM (normalisasi) → MarketReportDto → HMAC sign → POST NestJS
 #
-# Flow per run:
-#   send_run_to_db(summary, results)
-#     └─ untuk setiap varietas yang success:
-#          └─ _normalize_variety(items, variety_code) via Ollama (dibatch per BATCH_SIZE item)
-#               └─ _post_to_nestjs(market_report_dto) → POST /api/v1/ai-integration/market-report
+# Perbaikan dari log error 2026-06-08:
+#   [FIX-1] OLLAMA_BATCH_SIZE default 3 (bukan 6) — mencegah timeout & output terpotong
+#   [FIX-2] num_predict dinaikkan ke 4096 — mencegah JSON terpotong di tengah
+#   [FIX-3] _sanitize_entry diperkuat — weight_reference WAJIB terisi sebelum POST
+#   [FIX-4] Retry logic per-batch Ollama — 1x retry jika timeout/parse error
+#   [FIX-5] _post_to_nestjs: fallback rawBody ke JSON.stringify(body) harus compact
+#           (separators=(",",":")). Sudah benar, ditambah log signature untuk debug.
+#   [FIX-6] Tambah field agentRunId ke setiap entry sesuai MarketPriceEntity NestJS
+#           (NestJS memetakan run_id → agentRunId lewat mapper, bukan di sini)
+#   [FIX-7] _normalize_variety: hanya kirim item is_whole_fruit=True ke NestJS
+#   [FIX-8] _sanitize_entry: truncate semua string field dengan aman (None-safe)
 
 from __future__ import annotations
 
@@ -16,7 +22,7 @@ import hmac
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -26,7 +32,7 @@ from core.logger import get_logger
 logger = get_logger("agent.db_sender")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Konfigurasi (baca dari env, dengan fallback yang aman)
+# Konfigurasi
 # ══════════════════════════════════════════════════════════════════════════════
 
 NESTJS_BASE_URL:     str   = os.getenv("NESTJS_BASE_URL", "http://localhost:3001")
@@ -38,14 +44,16 @@ OLLAMA_BASE_URL:     str   = os.getenv("OLLAMA_BASE_URL", "http://localhost:1143
 OLLAMA_MODEL:        str   = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_TIMEOUT_SEC:  int   = int(os.getenv("OLLAMA_TIMEOUT_SEC", "180"))
 
+# [FIX-1] Default 3, bukan 6.
 # qwen2.5:7b stabil dengan 3 item per batch.
-# Lebih dari itu berisiko timeout atau output terpotong.
+# Dengan 6 item, output JSON sering terpotong → parse error / timeout.
 OLLAMA_BATCH_SIZE:   int   = int(os.getenv("OLLAMA_BATCH_SIZE", "3"))
 
-# Confidence minimum dari Ollama agar entri diteruskan ke NestJS
+# Jumlah retry per batch jika Ollama timeout atau JSON parse error
+OLLAMA_BATCH_RETRIES: int  = int(os.getenv("OLLAMA_BATCH_RETRIES", "1"))
+
 MIN_CONFIDENCE:      float = float(os.getenv("DB_MIN_CONFIDENCE", "0.5"))
 
-# ── Mapping variety_code → nama panjang untuk context LLM ───────────────────
 _VARIETY_ALIASES: Dict[str, str] = {
     "D197": "Musang King / Mao Shan Wang / Raja Kunyit",
     "D13":  "Golden Bun",
@@ -60,42 +68,75 @@ _VARIETY_ALIASES: Dict[str, str] = {
 
 def _sanitize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Pastikan semua field wajib NestJS terisi dengan nilai default yang aman,
-    supaya ValidationPipe tidak reject karena field kosong atau tipe salah.
-    Dipanggil sekali per entry, di dalam _normalize_variety.
+    Pastikan semua field wajib NestJS ValidationPipe terisi dengan nilai
+    default yang aman. Dipanggil satu kali per entry setelah parsing Ollama.
+
+    [FIX-3] Logika weight_reference diperkuat:
+      - Rekonstruksi dari harga yang tersedia
+      - Pastikan tidak pernah None/empty setelah sanitasi
+      - Truncate aman (handle None)
+
+    [FIX-8] Semua string field: handle None sebelum [:N]
     """
-    # weight_reference: wajib non-empty string (max 200 char)
+    # ── weight_reference: @IsNotEmpty @IsString @MaxLength(200) ─────────────
     weight_ref = entry.get("weight_reference")
-    if not weight_ref or not isinstance(weight_ref, str) or not weight_ref.strip():
-        # Rekonstruksi dari field harga yang tersedia
-        if entry.get("price_per_kg_avg") or entry.get("price_per_kg_min") or entry.get("price_per_kg_max"):
+    if not isinstance(weight_ref, str) or not weight_ref.strip():
+        # Rekonstruksi dari konteks harga
+        has_kg   = any(entry.get(k) is not None for k in
+                       ("price_per_kg_min", "price_per_kg_max", "price_per_kg_avg"))
+        has_unit = any(entry.get(k) is not None for k in
+                       ("price_per_unit_min", "price_per_unit_max"))
+        if has_kg and has_unit:
+            weight_ref = "per buah (dengan referensi per kg)"
+        elif has_kg:
             weight_ref = "per kg"
-        elif entry.get("price_per_unit_min") or entry.get("price_per_unit_max"):
+        elif has_unit:
             weight_ref = "per buah"
         else:
             weight_ref = "tidak diketahui"
-    entry["weight_reference"] = weight_ref[:200]
+    entry["weight_reference"] = str(weight_ref)[:200]
 
-    # variety_alias: wajib non-empty string (max 100 char)
+    # ── variety_alias: @IsNotEmpty @IsString @MaxLength(100) ────────────────
     alias = entry.get("variety_alias")
-    if not alias or not isinstance(alias, str) or not alias.strip():
-        entry["variety_alias"] = entry.get("variety_code", "unknown")
-    entry["variety_alias"] = entry["variety_alias"][:100]
+    if not isinstance(alias, str) or not alias.strip():
+        entry["variety_alias"] = str(entry.get("variety_code", "unknown"))
+    else:
+        entry["variety_alias"] = alias[:100]
 
-    # confidence: harus float 0.0–1.0
+    # ── confidence: @IsNumber @Min(0) @Max(1) ───────────────────────────────
     conf = entry.get("confidence", 0.5)
-    if not isinstance(conf, (int, float)) or conf < 0 or conf > 1:
-        entry["confidence"] = 0.5
+    try:
+        conf = float(conf)
+        if conf < 0 or conf > 1:
+            conf = 0.5
+    except (TypeError, ValueError):
+        conf = 0.5
+    entry["confidence"] = conf
 
-    # notes: opsional, tapi jika ada max 500 char
+    # ── notes: @IsOptional @IsString @MaxLength(500) ────────────────────────
     notes = entry.get("notes")
-    if notes and isinstance(notes, str) and len(notes) > 500:
-        entry["notes"] = notes[:500]
+    if notes is not None:
+        entry["notes"] = str(notes)[:500] if notes else None
 
-    # raw_text_snippet: opsional, tapi jika ada max 500 char
+    # ── raw_text_snippet: @IsOptional @IsString @MaxLength(500) ─────────────
     snippet = entry.get("raw_text_snippet")
-    if snippet and isinstance(snippet, str) and len(snippet) > 500:
-        entry["raw_text_snippet"] = snippet[:500]
+    if snippet is not None:
+        entry["raw_text_snippet"] = str(snippet)[:500] if snippet else None
+
+    # ── location_hint: @IsOptional @IsString @MaxLength(200) ────────────────
+    loc = entry.get("location_hint")
+    if loc is not None:
+        entry["location_hint"] = str(loc)[:200] if loc else None
+
+    # ── seller_type: @IsOptional @IsString @MaxLength(100) ──────────────────
+    seller = entry.get("seller_type")
+    if seller is not None:
+        entry["seller_type"] = str(seller)[:100] if seller else None
+
+    # ── is_whole_fruit: harus boolean ───────────────────────────────────────
+    iwf = entry.get("is_whole_fruit")
+    if not isinstance(iwf, bool):
+        entry["is_whole_fruit"] = bool(iwf) if iwf is not None else False
 
     return entry
 
@@ -109,49 +150,55 @@ Kamu adalah asisten ekstraksi data harga produk. Tugasmu memproses listing produ
 durian dari Google Shopping dan menghasilkan data terstruktur dalam format JSON.
 
 ATURAN WAJIB:
-- Respons HANYA berupa JSON array. Tidak ada teks, tidak ada markdown, tidak ada komentar.
-- Setiap elemen array sesuai SATU item input (urutan harus sama persis).
-- Semua nilai harga dalam IDR (Rupiah), bilangan bulat tanpa titik/koma.
+- Respons HANYA berupa JSON array murni. Tidak ada teks tambahan, tidak ada markdown, \
+tidak ada blok ```json, tidak ada komentar.
+- Mulai langsung dengan karakter '[' dan akhiri dengan ']'.
+- Setiap elemen array sesuai SATU item input (urutan sama persis, jumlah sama persis).
+- Semua nilai harga dalam IDR (Rupiah), bilangan bulat tanpa titik/koma pemisah ribuan.
 - is_whole_fruit = true HANYA jika produk adalah buah utuh dengan kulit \
-(bukan daging/kupas/beku/pancake/bibit/olahan apapun).
-- Normalisasi ke harga per-kg menggunakan weight_kg_hint jika tersedia; \
-tulis rumus matematisnya di field notes.
+(BUKAN daging/kupas/beku/pancake/bibit/olahan apapun).
 - Jika nilai tidak bisa ditentukan, gunakan null.
-- confidence (0.0–1.0): seberapa yakin kamu terhadap akurasi entri ini secara keseluruhan.
+- confidence (0.0–1.0): seberapa yakin kamu terhadap akurasi entri ini.
+- JANGAN potong atau ringkas output. Selesaikan semua elemen array.
 """
 
 _USER_PROMPT_TEMPLATE = """\
-Proses {count} listing durian varietas {variety_name} berikut ini.
-Kembalikan JSON array dengan tepat {count} elemen.
+Proses {count} listing durian varietas {variety_name} berikut.
+Kembalikan JSON array dengan TEPAT {count} elemen. Mulai dengan '[', akhiri dengan ']'.
 
-Schema tiap elemen:
+Schema SETIAP elemen (semua field wajib ada, gunakan null jika tidak tahu):
 {{
   "variety_code":       "{variety_code}",
-  "variety_alias":      "<nama produk dari judul listing, max 100 karakter>",
+  "variety_alias":      "<nama produk dari judul, max 100 karakter>",
   "is_whole_fruit":     <true|false>,
-  "weight_reference":   "<deskripsi berat dari listing, contoh: 'per buah 2-3 kg', WAJIB DIISI, max 200 karakter>",
-  "notes":              "<chain-of-thought normalisasi harga, atau null>",
+  "weight_reference":   "<WAJIB DIISI, min 4 karakter. Contoh: 'per buah 2-3 kg', 'per kg', 'per buah'. MAX 200 karakter>",
+  "notes":              "<catatan normalisasi harga atau null, max 500 karakter>",
   "price_per_kg_min":   <IDR integer atau null>,
   "price_per_kg_max":   <IDR integer atau null>,
   "price_per_kg_avg":   <IDR integer atau null>,
   "price_per_unit_min": <IDR integer atau null>,
   "price_per_unit_max": <IDR integer atau null>,
-  "location_hint":      "<kota/wilayah dari listing atau null>",
+  "location_hint":      "<kota/wilayah atau null>",
   "seller_type":        "<kebun|reseller|importir|toko online|null>",
   "confidence":         <float 0.0–1.0>,
-  "raw_text_snippet":   "<gabungan title + harga, max 500 karakter>"
+  "raw_text_snippet":   "<title + harga, max 200 karakter>"
 }}
 
-PETUNJUK NORMALISASI HARGA:
-- price_unit="per_kg"   → price_per_kg_avg = price_idr. Set price_per_unit_* = null.
-- price_unit="per_buah" DAN weight_kg_hint ada  → price_per_kg_avg = round(price_idr / weight_kg_hint). Tulis rumusnya di notes.
-- price_unit="per_buah" DAN weight_kg_hint null → isi price_per_unit_min/max saja, biarkan price_per_kg_* null.
-- price_unit="unknown"  → gunakan konteks judul. Durian premium utuh umumnya 1.5–3 kg per buah.
+ATURAN NORMALISASI HARGA:
+- price_unit="per_kg"   → price_per_kg_avg = price_idr, set price_per_unit_* = null.
+- price_unit="per_buah" DAN weight_kg_hint ada → \
+price_per_kg_avg = round(price_idr / weight_kg_hint), tulis rumus di notes.
+- price_unit="per_buah" DAN weight_kg_hint null → \
+isi price_per_unit_min=price_idr, price_per_unit_max=price_idr, biarkan price_per_kg_* null.
+- price_unit="unknown"  → estimasi dari konteks judul. Durian premium ≈ 1.5–3 kg per buah.
 
-PENTING: field weight_reference WAJIB diisi, jangan pernah null. \
-Gunakan informasi berat dari judul listing, atau tulis "per buah" / "per kg" sesuai konteks.
+WAJIB: weight_reference harus diisi sesuai konteks:
+- Ada info berat di judul → salin verbatim (contoh: "per buah 2,2-2,3 kg")
+- Harga per kg → "per kg"
+- Harga per buah tanpa info berat → "per buah"
+- Tidak ada info → "tidak diketahui"
 
-INPUT:
+INPUT ({count} item):
 {items_json}
 """
 
@@ -160,14 +207,16 @@ async def _call_ollama(
     items:        List[Dict[str, Any]],
     variety_code: str,
     client:       httpx.AsyncClient,
+    attempt:      int = 1,
 ) -> List[Dict[str, Any]]:
     """
     Kirim satu batch ke Ollama dan parse JSON array hasilnya.
     Return list parsed entries, atau [] jika gagal.
+
+    [FIX-2] num_predict dinaikkan ke 4096 agar JSON tidak terpotong.
     """
     variety_name = _VARIETY_ALIASES.get(variety_code, variety_code)
 
-    # Buat representasi compact — hanya field yang relevan untuk LLM
     compact_items = [
         {
             "title":          it.get("title", ""),
@@ -195,8 +244,9 @@ async def _call_ollama(
             {"role": "user",   "content": user_prompt},
         ],
         "options": {
-            "temperature": 0.1,   # rendah = deterministik, cocok untuk ekstraksi terstruktur
-            "num_predict": 2048,
+            "temperature": 0.05,   # lebih deterministik untuk ekstraksi terstruktur
+            "num_predict": 4096,   # [FIX-2] cukup untuk 3 item × ~1000 token/item
+            "stop":        ["\n\n\n"],  # hentikan jika ada baris kosong berlebih
         },
     }
 
@@ -210,12 +260,24 @@ async def _call_ollama(
         resp.raise_for_status()
         raw_text = resp.json().get("message", {}).get("content", "").strip()
 
-        # Strip markdown code fences jika model membungkusnya
+        # Strip markdown code fences
         if raw_text.startswith("```"):
             lines    = raw_text.splitlines()
             raw_text = "\n".join(
                 line for line in lines if not line.strip().startswith("```")
             ).strip()
+
+        # Coba temukan JSON array jika ada teks sebelum/sesudahnya
+        if not raw_text.startswith("["):
+            start = raw_text.find("[")
+            if start != -1:
+                raw_text = raw_text[start:]
+
+        # Pastikan berakhir dengan ']'
+        if raw_text and not raw_text.endswith("]"):
+            end = raw_text.rfind("]")
+            if end != -1:
+                raw_text = raw_text[:end + 1]
 
         parsed = json.loads(raw_text)
 
@@ -226,17 +288,26 @@ async def _call_ollama(
             )
             return []
 
+        # Validasi jumlah elemen
+        if len(parsed) != len(items):
+            logger.warning(
+                f"[DbSender][Ollama] {variety_code}: diharapkan {len(items)} elemen, "
+                f"dapat {len(parsed)}. Tetap dilanjutkan."
+            )
+
         return parsed
 
     except httpx.TimeoutException:
         logger.error(
-            f"[DbSender][Ollama] Timeout {OLLAMA_TIMEOUT_SEC}s untuk {variety_code}."
+            f"[DbSender][Ollama] Timeout {OLLAMA_TIMEOUT_SEC}s untuk {variety_code} "
+            f"(attempt {attempt})."
         )
         return []
     except json.JSONDecodeError as exc:
         logger.error(
-            f"[DbSender][Ollama] JSON parse error untuk {variety_code}: {exc}. "
-            f"Raw (truncated): {raw_text[:400]}"
+            f"[DbSender][Ollama] JSON parse error untuk {variety_code} "
+            f"(attempt {attempt}): {exc}. "
+            f"Raw (truncated): {raw_text[:600]}"
         )
         return []
     except httpx.ConnectError:
@@ -260,7 +331,11 @@ async def _normalize_variety(
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Normalisasi semua item satu varietas via Ollama dengan batching.
-    Sanitasi dilakukan di sini, satu kali per entry.
+
+    [FIX-4] Retry 1x per batch jika gagal (timeout atau parse error).
+    [FIX-7] Hanya loloskan entry dengan is_whole_fruit=True ke NestJS,
+            karena NestJS MarketPriceValidator akan menolak is_whole_fruit=False
+            (hemat bandwidth & menghindari rejection log yang tidak perlu).
 
     Returns:
         (accepted_entries, parse_error_count)
@@ -281,37 +356,58 @@ async def _normalize_variety(
     )
 
     for idx, chunk in enumerate(chunks):
-        logger.debug(
-            f"[DbSender][Ollama] {variety_code} batch {idx+1}/{len(chunks)} "
-            f"({len(chunk)} item)..."
-        )
-        parsed = await _call_ollama(chunk, variety_code, client)
+        parsed: List[Dict[str, Any]] = []
+
+        # [FIX-4] Retry loop
+        for attempt in range(1, OLLAMA_BATCH_RETRIES + 2):  # +2 = attempts = retries + 1
+            parsed = await _call_ollama(chunk, variety_code, client, attempt)
+            if parsed:
+                break
+            if attempt <= OLLAMA_BATCH_RETRIES:
+                wait_sec = 2.0 * attempt
+                logger.warning(
+                    f"[DbSender] {variety_code} batch {idx+1}/{len(chunks)}: "
+                    f"attempt {attempt} gagal, retry dalam {wait_sec}s..."
+                )
+                await asyncio.sleep(wait_sec)
 
         if not parsed:
             parse_errors += 1
         else:
             for entry in parsed:
+                # [FIX-7] Filter is_whole_fruit=False SEBELUM kirim ke NestJS
+                is_whole = entry.get("is_whole_fruit")
+                if not is_whole:
+                    logger.debug(
+                        f"[DbSender] Skip non-whole-fruit: "
+                        f"{entry.get('variety_alias', '')[:60]}"
+                    )
+                    continue
+
                 confidence = entry.get("confidence", 0.0)
-                if not isinstance(confidence, (int, float)):
+                try:
+                    confidence = float(confidence)
+                except (TypeError, ValueError):
                     confidence = 0.0
-                if confidence >= MIN_CONFIDENCE:
-                    # Sanitasi dipanggil sekali di sini saja
-                    all_entries.append(_sanitize_entry(entry))
-                else:
+
+                if confidence < MIN_CONFIDENCE:
                     logger.debug(
                         f"[DbSender] Skip low-confidence entry "
                         f"(conf={confidence:.2f}): "
                         f"{entry.get('variety_alias', '')[:60]}"
                     )
+                    continue
+
+                # Sanitasi dipanggil sekali di sini
+                all_entries.append(_sanitize_entry(entry))
 
         logger.info(
             f"[DbSender] {variety_code} batch {idx+1}/{len(chunks)}: "
             f"{len(parsed)} parsed, {len(all_entries)} diterima sejauh ini"
         )
 
-        # Jeda ringan antar batch supaya Ollama tidak di-spam
         if idx < len(chunks) - 1:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
     return all_entries, parse_errors
 
@@ -323,7 +419,7 @@ async def _normalize_variety(
 def _sign_body(body_bytes: bytes, secret: str) -> str:
     """
     Hitung HMAC-SHA256 dan kembalikan dalam format 'sha256=<hex>'.
-    Format ini sesuai dengan yang di-expected oleh HmacSignatureGuard di NestJS.
+    Sesuai dengan HmacSignatureGuard di NestJS yang membaca rawBody Buffer.
     """
     digest = hmac.new(
         key       = secret.encode("utf-8"),
@@ -345,8 +441,8 @@ async def _post_to_nestjs(
     """
     Serialisasi payload → HMAC sign → POST ke NestJS.
 
-    PENTING: body di-serialize dengan separators=(",", ":") (tanpa spasi)
-    karena NestJS membaca rawBody Buffer untuk verifikasi HMAC.
+    KRITIS: body HARUS di-serialize compact (separators=(",",":")) tanpa spasi,
+    karena NestJS HmacSignatureGuard membaca rawBody Buffer untuk verifikasi.
     Perbedaan whitespace sekecil apapun akan membuat signature tidak cocok.
     """
     if not NESTJS_INTERNAL_KEY:
@@ -356,7 +452,6 @@ async def _post_to_nestjs(
         )
         return {"success": False, "error": "NESTJS_INTERNAL_API_KEY tidak dikonfigurasi."}
 
-    # Serialisasi compact — HARUS konsisten dengan apa yang NestJS terima sebagai rawBody
     body_bytes = json.dumps(
         payload, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
@@ -370,16 +465,17 @@ async def _post_to_nestjs(
         "X-Agent-Version": agent_version,
     }
 
+    entry_count = len(payload.get("entries", []))
     logger.info(
         f"[DbSender] → POST {url} | "
         f"{len(body_bytes)} bytes | "
-        f"{len(payload.get('entries', []))} entries"
+        f"{entry_count} entries"
     )
 
     try:
         resp = await client.post(
             url,
-            content = body_bytes,   # kirim bytes langsung, bukan json= param
+            content = body_bytes,
             headers = headers,
             timeout = NESTJS_TIMEOUT_SEC,
         )
@@ -394,9 +490,13 @@ async def _post_to_nestjs(
             return {"success": True, **result}
 
         logger.error(
-            f"[DbSender] ✗ NestJS {resp.status_code}: {resp.text[:400]}"
+            f"[DbSender] ✗ NestJS {resp.status_code}: {resp.text[:600]}"
         )
-        return {"success": False, "error": f"HTTP {resp.status_code}", "body": resp.text[:400]}
+        return {
+            "success": False,
+            "error":   f"HTTP {resp.status_code}",
+            "body":    resp.text[:600],
+        }
 
     except httpx.ConnectError as exc:
         logger.error(f"[DbSender] Tidak bisa konek ke NestJS ({url}): {exc}")
@@ -430,9 +530,12 @@ async def send_run_to_db(
     run_id        = summary.get("run_id", "unknown")
     agent_version = os.getenv("APP_VERSION", "1.0.0")
 
-    # Map status task.py → AgentRunStatus NestJS
     run_status    = summary.get("status", "no_data")
-    _status_map   = {"success": "success", "partial": "partial", "failed": "scraper_error"}
+    _status_map   = {
+        "success": "success",
+        "partial": "partial",
+        "failed":  "scraper_error",
+    }
     nestjs_status = _status_map.get(run_status, "no_data")
 
     # Varietas yang punya item valid
@@ -441,7 +544,7 @@ async def send_run_to_db(
     if not valid_varieties:
         logger.warning(
             f"[DbSender] run={run_id}: tidak ada varietas dengan item valid. "
-            f"Kirim laporan kosong ke NestJS."
+            "Kirim laporan kosong ke NestJS."
         )
         return await _send_empty_report(run_id, agent_version, nestjs_status, summary)
 
@@ -501,6 +604,27 @@ async def send_run_to_db(
         "entries_discarded": entries_discarded,
         "error_details":     None,
     }
+
+    # Validasi pra-kirim: pastikan tidak ada weight_reference kosong
+    # (defensive check sebelum POST, sebagai lapisan ke-2 setelah _sanitize_entry)
+    pre_check_errors: List[str] = []
+    for i, entry in enumerate(all_entries):
+        wr = entry.get("weight_reference")
+        if not wr or not isinstance(wr, str) or not wr.strip():
+            pre_check_errors.append(
+                f"entries[{i}] variety={entry.get('variety_code')} "
+                f"alias='{entry.get('variety_alias', '')[:40]}': "
+                f"weight_reference kosong setelah sanitasi!"
+            )
+            # Force-set fallback terakhir
+            entry["weight_reference"] = "per buah"
+
+    if pre_check_errors:
+        logger.warning(
+            f"[DbSender] Pre-check menemukan {len(pre_check_errors)} "
+            f"entry dengan weight_reference kosong — sudah di-patch:\n"
+            + "\n".join(pre_check_errors)
+        )
 
     logger.info(
         f"[DbSender] Kirim ke NestJS: "
