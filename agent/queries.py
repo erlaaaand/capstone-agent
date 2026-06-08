@@ -53,10 +53,11 @@ class DurianQuery:
 
 # ── 4 Varietas Target ─────────────────────────────────────────────────────────
 #
-# PRINSIP QUERY:
-# "jual durian [nama] buah utuh segar"  → sinyal kuat ke Google Shopping
-# "per buah" / "per biji" / "per kg"   → disambiguasi satuan
-# Tanpa kata: daging, kupas, frozen, bibit, olahan
+# PRINSIP QUERY BARU:
+# - Gunakan kata kunci yang natural digunakan oleh SELLER (singkat, padat, menggunakan kode).
+# - Hindari over-filtering di tingkat Search Engine (jangan gunakan "segar per buah berkulit").
+# - Biarkan SerpApi menarik data yang luas (bibit/kupas mungkin masuk), lalu biarkan 
+#   Ollama LLM yang memfilter is_whole_fruit di tahap normalisasi untuk mendapatkan harga wajar.
 
 DURIAN_QUERIES: List[DurianQuery] = [
 
@@ -64,14 +65,14 @@ DURIAN_QUERIES: List[DurianQuery] = [
         variety_code = "D197",
         variety_name = "Musang King / Raja Kunyit / Mao Shan Wang",
         search_queries = [
-            # Query utama: paling spesifik
-            "jual durian musang king buah utuh segar per buah",
-            # Fallback 1: nama Malaysia + satuan
-            "jual durian mao shan wang buah utuh berkulit",
-            # Fallback 2: nama populer Indonesia
-            "jual durian raja kunyit buah utuh segar berkulit",
-            # Fallback 3: lebih longgar tapi tetap ada "buah utuh"
-            "durian musang king buah utuh berkulit segar",
+            # Utama: Sangat umum dipakai seller
+            "durian musang king utuh",
+            # Fallback 1: Menggunakan kode
+            "durian D197 utuh",
+            # Fallback 2: Kata kunci alternatif populer
+            "durian mao shan wang utuh",
+            # Fallback 3: Sangat broad jika hasil masih kurang
+            "durian musang king fresh",
         ],
         min_results = 3,
         num_results = 40,
@@ -81,9 +82,14 @@ DURIAN_QUERIES: List[DurianQuery] = [
         variety_code = "D13",
         variety_name = "Golden Bun",
         search_queries = [
-            "jual durian golden bun buah utuh segar per buah",
-            "jual durian D13 golden bun buah utuh berkulit",
-            "durian golden bun buah utuh segar berkulit",
+            # Utama: Kombinasi kode dan utuh (Seller sering pakai D13)
+            "durian D13 utuh",
+            # Fallback 1: Menggunakan nama komersial
+            "durian golden bun utuh",
+            # Fallback 2: Broad query untuk D13
+            "durian D13 fresh",
+            # Fallback 3: Tanpa kata "utuh" (Ollama yang akan memfilter nanti)
+            "durian D13 asli",
         ],
         min_results = 2,
         num_results = 40,
@@ -93,9 +99,14 @@ DURIAN_QUERIES: List[DurianQuery] = [
         variety_code = "D24",
         variety_name = "Sultan / Bukit Merah",
         search_queries = [
-            "jual durian sultan D24 buah utuh segar per buah",
-            "jual durian bukit merah D24 buah utuh berkulit",
-            "durian sultan D24 buah utuh segar berkulit",
+            # Utama: Kode sangat dominan untuk D24
+            "durian D24 utuh",
+            # Fallback 1: Kombinasi nama dan kode
+            "durian sultan D24",
+            # Fallback 2: Varian nama lokal
+            "durian bukit merah utuh",
+            # Fallback 3: Broad query
+            "durian D24 fresh",
         ],
         min_results = 2,
         num_results = 40,
@@ -105,9 +116,14 @@ DURIAN_QUERIES: List[DurianQuery] = [
         variety_code = "D2",
         variety_name = "Dato Nina",
         search_queries = [
-            "jual durian dato nina buah utuh segar per buah",
-            "jual durian D2 dato nina buah utuh berkulit",
-            "durian dato nina buah utuh segar berkulit",
+            # Utama: Sangat langka, langsung tembak kode
+            "durian D2 utuh",
+            # Fallback 1: Menggunakan nama komersial
+            "durian dato nina utuh",
+            # Fallback 2: Broad query
+            "durian D2 dato nina",
+            # Fallback 3: Pencarian paling umum untuk varietas ini
+            "durian D2 asli",
         ],
         min_results = 1,   # D2 lebih langka di pasaran online
         num_results = 40,
