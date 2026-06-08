@@ -1,0 +1,22 @@
+# requirements.txt — Market Intelligence Agent
+# Python 3.11+ direkomendasikan
+# Install: pip install -r requirements.txt
+
+# ── Web Framework ─────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# ── Data Validation & Settings ────────────────────────────────
+pydantic==2.10.3
+python-dotenv==1.0.1
+
+# ── HTTP Client ───────────────────────────────────────────────
+httpx==0.28.1
+
+# ── Scheduler ─────────────────────────────────────────────────
+apscheduler==3.10.4
+tzdata==2024.2          # Timezone database (wajib di Windows)
+
+# ── Utilities ─────────────────────────────────────────────────
+python-multipart==0.0.20
+anyio==4.7.0
