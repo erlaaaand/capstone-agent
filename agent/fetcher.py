@@ -1,28 +1,12 @@
 # agent/fetcher.py
 #
-# Fetch → filter → ekstrak field bersih, siap masuk DB.
+# Fetch → filter → ekstrak field bersih, siap masuk price_extractor.
 #
-# Perbaikan 2026-06-08 v2 (di atas perbaikan sebelumnya):
-#   [FIX-F5] _WHOLE_FRUIT_SIGNALS diperluas: tambah "impor", "malaysia",
-#            "premium", "original", "asli" — kata-kata yang seller Indonesia
-#            pakai untuk durian impor utuh (D13/D2 khususnya).
-#   [FIX-F6] _VARIETY_KEYWORDS D2 diperkuat: "dato nina", "datuk nina",
-#            "dato nena", "durian d2" — "d2" saja terlalu ambigu.
-#            Kata "d2" standalone dihapus dari keyword wajib.
-#   [FIX-F7] _VARIETY_KEYWORDS D13 diperluas: tambah ejaan dan frasa
-#            yang dipakai seller marketplace Indonesia.
-#   [FIX-F8] _is_valid_item: support DurianQuery.relaxed_variety_check
-#            untuk D13/D2 yang langka — jika relaxed=True, tidak wajib
-#            ada nama varietas di judul, cukup sinyal buah utuh.
-#   [FIX-F9] _fetch_variety: jika relaxed_variety_check=True dan
-#            tidak ada hasil, gunakan harga referensi dari sumber
-#            durian impor generik sebagai fallback estimasi.
-#   [FIX-F10] Dedup key diubah: title saja (lowercase) per toko,
-#             produk sama di toko berbeda tetap masuk (sudah ada sebelumnya).
-#   [FIX-F11] _process_response: terima variety_code_override dari DurianQuery
-#             untuk labeling ulang entry yang match via relaxed mode.
-#
-# Output tiap varietas: (tidak berubah dari versi sebelumnya)
+# v3 Changes (tanpa Ollama):
+#   - Filter _is_valid_item diperkuat: relaxed mode WAJIB ada keyword varietas
+#     dari variety_keyword_extras (tidak cukup "durian" saja).
+#   - D2 sekarang non-relaxed: nama varietas WAJIB ada di judul.
+#   - Output item sudah bersih, langsung diproses price_extractor (tanpa LLM).
 
 from __future__ import annotations
 
@@ -48,88 +32,60 @@ _ENDPOINT = "/search"
 # ══════════════════════════════════════════════════════════════════════════════
 
 _REJECT_KEYWORDS: FrozenSet[str] = frozenset({
-    # Produk kupas / daging
     "kupas", "dikupas", "flesh", "pulp", "daging",
-    # Produk beku / olahan dingin
     "frozen", "beku", "freezer", "vacum", "vacuum", "nitro",
-    # Produk olahan makanan
     "pancake", "biskuit", "kue", "cake", "pudding",
     "jelly", "extract", "sari", "minuman", "juice", "sirup",
     "lempok", "dodol", "es krim", "ice cream",
-    # Bibit / tanaman
     "bibit", "benih", "seedling", "pohon", "tanam",
     "entres", "okulasi", "cangkok", "sambung",
-    # Non-makanan
     "sabun", "parfum", "lotion", "kosmetik",
     "buku", "kaos", "souvenir",
-    # Kemasan gram kecil (olahan)
     "100gr", "100g", "200gr", "200g", "250gr", "250g",
     "400gr", "400g", "500gr", "500g",
     "100 gr", "200 gr", "250 gr", "400 gr", "500 gr",
 })
 
-# [FIX-F5] Diperluas dengan kata yang dipakai seller durian impor Indonesia.
-# "impor" dan "malaysia" sangat kuat karena D13/D2 memang barang impor Malaysia.
-# "premium" sering muncul di listing durian utuh mahal (D197/D13/D2/D24).
 _WHOLE_FRUIT_SIGNALS: FrozenSet[str] = frozenset({
-    # Sinyal eksplisit buah utuh
     "utuh", "berkulit", "segar", "bulat",
     "per buah", "per biji", "1 buah", "1buah",
     "whole", "fresh",
-    # Sinyal impor (D13/D2 selalu impor dari Malaysia)
     "import", "impor", "malaysia", "imported",
-    # Sinyal kualitas yang identik dengan buah utuh premium
     "premium", "original", "asli", "ori",
-    # Frasa khas toko online Indonesia
     "buah utuh", "segar berkulit", "utuh segar",
-    "buah segar", "fresh import", "beli per buah",
-    "per buah utuh",
-    # Ukuran buah (seller gunakan ini untuk buah utuh)
+    "buah segar", "fresh import",
     "(l)", "(m)", "(s)", "(xl)", " l ", " m ", " s ",
 })
 
-# [FIX-F6] [FIX-F7] Keyword varietas — diperkuat untuk D2 dan D13.
-# PENTING: "d2" standalone dihapus dari D2 karena terlalu ambigu.
-# Tetap dipertahankan di variety_keyword_extras DurianQuery sebagai
-# secondary check bersama konfirmasi "durian" di judul.
 _VARIETY_KEYWORDS: Dict[str, FrozenSet[str]] = {
     "D197": frozenset({
         "musang king", "mao shan wang", "raja kunyit",
         "msw", "d197", "musangking",
     }),
     "D13": frozenset({
-        "golden bun",
-        "d13",
-        # [FIX-F7] Tambahan ejaan/frasa yang dipakai seller lokal
-        "goldenbun", "golden-bun",
+        "golden bun", "d13", "goldenbun", "golden-bun",
     }),
     "D24": frozenset({
         "sultan", "bukit merah", "d24", "malayd24", "malay d24",
     }),
     "D2": frozenset({
-        # [FIX-F6] "d2" standalone dihapus karena ambigu
-        # Hanya frasa lengkap yang jelas merujuk varietas durian
+        # "d2" standalone dihapus — terlalu ambigu
         "dato nina", "datuk nina", "dato nena",
-        "durian d2",    # Harus ada kata "durian" sebelum "d2"
+        "durian d2",
     }),
 }
 
 _MIN_PRICE_IDR: float = 100_000.0
 _MAX_PRICE_IDR: float = 10_000_000.0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Ekstraksi berat dari judul
-# ══════════════════════════════════════════════════════════════════════════════
-
 _WEIGHT_PATTERNS = [
-    # "2,2-2,3 kg" atau "2.0-2.1kg" — range, ambil tengah
     re.compile(r"(\d+[,.]?\d*)\s*[-–]\s*(\d+[,.]?\d*)\s*kg", re.I),
-    # "~1,5kg" atau "2Kg"
     re.compile(r"~?\s*(\d+[,.]?\d+)\s*kg", re.I),
-    # "2 kg" (angka bulat)
     re.compile(r"\b(\d)\s*kg\b", re.I),
 ]
+
+_SMALL_GRAM_RE  = re.compile(r"\b\d+\+*\s*gr(am)?\b", re.I)
+_MAX_SMALL_GRAM = 900
 
 
 def _extract_weight_kg(title: str) -> Optional[float]:
@@ -162,14 +118,6 @@ def _detect_price_unit(title: str) -> str:
     return "unknown"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Filter & Ekstraksi
-# ══════════════════════════════════════════════════════════════════════════════
-
-_SMALL_GRAM_RE  = re.compile(r"\b\d+\+*\s*gr(am)?\b", re.I)
-_MAX_SMALL_GRAM = 900
-
-
 def _is_valid_item(
     title:        str,
     price_idr:    float,
@@ -179,14 +127,14 @@ def _is_valid_item(
     """
     Validasi satu item listing.
 
-    [FIX-F8] Support relaxed_variety_check dari DurianQuery:
-    - Normal mode: nama varietas WAJIB ada di judul.
-    - Relaxed mode (D13/D2): nama varietas ATAU sinyal buah utuh yang kuat cukup.
-      Ini untuk varietas langka yang seller tidak label nama varietasnya.
+    Normal mode  : nama varietas WAJIB ada di judul (dari _VARIETY_KEYWORDS ATAU extras).
+    Relaxed mode : kata "durian" WAJIB ada DAN setidaknya satu keyword dari
+                   variety_keyword_extras WAJIB ada di judul.
+                   (Lebih ketat dari v2 — tidak cukup sinyal buah utuh saja)
     """
     t = title.lower()
 
-    # 1. Reject kata kunci berbahaya (selalu berlaku)
+    # 1. Reject kata kunci berbahaya
     for kw in _REJECT_KEYWORDS:
         if kw in t:
             return False, f"kata reject: '{kw}'"
@@ -198,60 +146,58 @@ def _is_valid_item(
         if gram_str:
             gram_val = int(gram_str)
             if gram_val <= _MAX_SMALL_GRAM:
-                return False, (
-                    f"kemasan gram kecil: '{m.group()}' "
-                    f"({gram_val}gr ≤ {_MAX_SMALL_GRAM}gr)"
-                )
+                return False, f"kemasan gram kecil: '{m.group()}' ({gram_val}gr)"
 
-    # 2. Harga masuk akal (selalu berlaku)
+    # 2. Harga masuk akal
     if price_idr < _MIN_PRICE_IDR:
-        return False, f"harga terlalu rendah (Rp{price_idr:,.0f} < min Rp{_MIN_PRICE_IDR:,.0f})"
+        return False, f"harga terlalu rendah (Rp{price_idr:,.0f})"
     if price_idr > _MAX_PRICE_IDR:
-        return False, f"harga terlalu tinggi (Rp{price_idr:,.0f} > max Rp{_MAX_PRICE_IDR:,.0f})"
+        return False, f"harga terlalu tinggi (Rp{price_idr:,.0f})"
 
-    # 3. Cek kata kunci varietas
+    # 3. Kumpulkan semua keyword varietas
     primary_keywords   = _VARIETY_KEYWORDS.get(variety_code, frozenset())
     extra_keywords     = dq.variety_keyword_extras if dq else frozenset()
     all_variety_kws    = primary_keywords | extra_keywords
-    has_variety_kw     = any(kw in t for kw in all_variety_kws)
 
-    # Khusus D2: "d2" boleh lolos JIKA ada kata "durian" di judul juga
-    # (menghindari "Vitamin D2", "Kamera D2", dll.)
+    has_variety_kw = any(kw in t for kw in all_variety_kws)
+
+    # Khusus D2: "d2" boleh lolos JIKA ada kata "durian" juga
     if variety_code == "D2" and not has_variety_kw:
         if "d2" in t and "durian" in t:
             has_variety_kw = True
 
-    # 4. Sinyal buah utuh
-    has_signal    = any(kw in t for kw in _WHOLE_FRUIT_SIGNALS)
-    has_weight    = _extract_weight_kg(title) is not None
-    has_durian    = "durian" in t or "duren" in t
-    # Harga buah utuh premium biasanya > 300rb
-    price_looks_whole = price_idr >= 300_000
-
-    # [FIX-F8] Mode relaxed untuk varietas langka (D13/D2)
     relaxed = dq.relaxed_variety_check if dq else False
 
     if relaxed:
-        # Di mode relaxed: WAJIB ada kata "durian" + sinyal buah utuh
-        # TIDAK wajib ada nama varietas (karena seller tidak label)
-        if not has_durian:
-            return False, "relaxed mode: kata 'durian'/'duren' tidak ada di judul"
-        if not (has_signal or has_weight or price_looks_whole):
-            return False, "relaxed mode: tidak ada sinyal buah utuh sama sekali"
-        # Untuk relaxed mode, varietas keyword check BUKAN syarat wajib
-        # tapi kita log jika ada untuk tracking
+        # Relaxed mode: WAJIB ada kata "durian" DAN setidaknya satu keyword
+        # dari variety_keyword_extras (bukan cukup sinyal buah utuh saja).
+        if not ("durian" in t or "duren" in t):
+            return False, "relaxed mode: kata 'durian' tidak ada di judul"
+        
+        extra_kws = dq.variety_keyword_extras if dq else frozenset()
+        has_extra = any(kw in t for kw in extra_kws)
+        
+        if not has_extra and not has_variety_kw:
+            return False, (
+                "relaxed mode: tidak ada keyword varietas "
+                f"({variety_code}) di judul"
+            )
         return True, ""
 
     # Normal mode: nama varietas WAJIB ada
     if not has_variety_kw:
-        return False, "nama varietas tidak ada di judul"
+        return False, f"nama varietas {variety_code} tidak ada di judul"
 
-    # Normal mode: sinyal buah utuh
+    # Sinyal buah utuh
+    has_signal     = any(kw in t for kw in _WHOLE_FRUIT_SIGNALS)
+    has_weight     = _extract_weight_kg(title) is not None
+    has_durian     = "durian" in t or "duren" in t
+    price_ok_whole = price_idr >= 300_000
+
     if not has_signal and not has_weight:
-        if not (has_durian and price_looks_whole):
+        if not (has_durian and price_ok_whole):
             return False, (
-                "tidak ada sinyal buah utuh, tidak ada info berat, "
-                "dan harga tidak mencerminkan buah utuh"
+                "tidak ada sinyal buah utuh dan harga tidak mencerminkan buah utuh"
             )
 
     return True, ""
@@ -298,6 +244,7 @@ def _extract_clean_item(
         "weight_kg_hint": weight_kg,
         "price_unit":     price_unit,
         "source":         raw_item.get("source"),
+        "source_url":     raw_item.get("product_link", ""),
         "rating":         raw_item.get("rating"),
         "reviews":        raw_item.get("reviews"),
         "delivery":       raw_item.get("delivery"),
@@ -330,8 +277,6 @@ def _process_response(
             rejected += 1
             continue
 
-        # Deduplicate: title (lowercase) + source + harga
-        # Produk sama di toko berbeda tetap masuk (beda harga = info berharga)
         key = f"{item['title'].lower()}|{item['source']}|{item['price_idr']}"
         if key in seen:
             continue
@@ -506,7 +451,6 @@ async def _fetch_variety(
 
         if is_no_results:
             all_no_results += 1
-            logger.info(f"[Fetcher] '{query_str}' → Google tidak punya hasil.")
             continue
 
         if error:
@@ -534,9 +478,9 @@ async def _fetch_variety(
             )
             break
 
-    fetched_at = datetime.now(timezone.utc).isoformat()
-
+    fetched_at        = datetime.now(timezone.utc).isoformat()
     all_queries_tried = len(dq.search_queries)
+
     if all_no_results == all_queries_tried and best_count == 0:
         logger.warning(
             f"[Fetcher] '{dq.variety_code}' tidak ditemukan di Google Shopping "
@@ -575,15 +519,14 @@ async def _fetch_variety(
     if best_count < dq.min_results:
         logger.warning(
             f"[Fetcher] '{dq.variety_code}' hanya {best_count} item valid "
-            f"(min={dq.min_results}). Semua {all_queries_tried} query sudah dicoba. "
-            f"Data tetap disimpan."
+            f"(min={dq.min_results}). Data tetap disimpan."
         )
 
     success = best_count > 0
     logger.info(
         f"[Fetcher] {'✓' if success else '✗'} '{dq.variety_name}': "
         f"{best_count} item valid | query='{best_query}'"
-        + (f" | RELAXED MODE" if dq.relaxed_variety_check else "")
+        + (f" | RELAXED" if dq.relaxed_variety_check else "")
     )
 
     return {
@@ -671,8 +614,8 @@ async def fetch_all() -> List[dict]:
 
     logger.info(
         f"[Fetcher] Selesai: {succeeded}/{len(final)} berhasil | "
-        f"{no_results} tidak ada data di Google | "
-        f"{total_items} item buah utuh total."
+        f"{no_results} tidak ada data | "
+        f"{total_items} item total."
     )
 
     return final
