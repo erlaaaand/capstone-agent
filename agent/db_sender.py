@@ -1,18 +1,27 @@
 # agent/db_sender.py
 #
-# Pipeline: raw fetcher items → Ollama LLM (normalisasi) → MarketReportDto → HMAC sign → POST NestJS
+# Pipeline: raw fetcher items → Ollama LLM (normalisasi) → MarketReportDto
+#           → HMAC sign → POST NestJS
 #
-# Perbaikan dari log error 2026-06-08:
-#   [FIX-1] OLLAMA_BATCH_SIZE default 3 (bukan 6) — mencegah timeout & output terpotong
-#   [FIX-2] num_predict dinaikkan ke 4096 — mencegah JSON terpotong di tengah
-#   [FIX-3] _sanitize_entry diperkuat — weight_reference WAJIB terisi sebelum POST
-#   [FIX-4] Retry logic per-batch Ollama — 1x retry jika timeout/parse error
-#   [FIX-5] _post_to_nestjs: fallback rawBody ke JSON.stringify(body) harus compact
-#           (separators=(",",":")). Sudah benar, ditambah log signature untuk debug.
-#   [FIX-6] Tambah field agentRunId ke setiap entry sesuai MarketPriceEntity NestJS
-#           (NestJS memetakan run_id → agentRunId lewat mapper, bukan di sini)
-#   [FIX-7] _normalize_variety: hanya kirim item is_whole_fruit=True ke NestJS
-#   [FIX-8] _sanitize_entry: truncate semua string field dengan aman (None-safe)
+# Perbaikan 2026-06-08 v2:
+#   [FIX-1]  OLLAMA_BATCH_SIZE default 3 — mencegah timeout & output terpotong
+#   [FIX-2]  num_predict dinaikkan ke 4096 — mencegah JSON terpotong
+#   [FIX-3]  _sanitize_entry diperkuat — weight_reference WAJIB terisi
+#   [FIX-4]  Retry logic per-batch Ollama — 1x retry jika timeout/parse error
+#   [FIX-5]  _post_to_nestjs: body compact (separators=(",",":"))
+#   [FIX-6]  is_whole_fruit logic diperbaiki di prompt Ollama
+#   [FIX-7]  DIHAPUS: filter is_whole_fruit di Python — biarkan NestJS yang filter.
+#            Alasan: Ollama kadang set is_whole_fruit=false untuk buah utuh valid
+#            karena judul tidak eksplisit. NestJS sudah punya validator sendiri.
+#            Python hanya filter confidence < MIN_CONFIDENCE.
+#   [FIX-8]  _sanitize_entry: truncate semua string field dengan aman (None-safe)
+#   [FIX-9]  BARU: Prompt Ollama diperbaiki untuk D13/D2 (relaxed_variety_check):
+#            jika query_used mengandung kata varietas langka tapi judul tidak,
+#            tetap set variety_code berdasarkan query context, bukan judul saja.
+#   [FIX-10] BARU: is_whole_fruit defaulting: jika fetcher sudah lolos _is_valid_item
+#            (artinya buah utuh), set is_whole_fruit=true sebagai default kuat
+#            di _sanitize_entry kecuali ada sinyal jelas produk olahan.
+#   [FIX-11] BARU: _normalize_variety menerima DurianQuery untuk context prompt.
 
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ import httpx
 
 from core import config
 from core.logger import get_logger
+from agent.queries import DurianQuery
 
 logger = get_logger("agent.db_sender")
 
@@ -44,14 +54,12 @@ OLLAMA_BASE_URL:     str   = os.getenv("OLLAMA_BASE_URL", "http://localhost:1143
 OLLAMA_MODEL:        str   = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_TIMEOUT_SEC:  int   = int(os.getenv("OLLAMA_TIMEOUT_SEC", "180"))
 
-# [FIX-1] Default 3, bukan 6.
-# qwen2.5:7b stabil dengan 3 item per batch.
-# Dengan 6 item, output JSON sering terpotong → parse error / timeout.
-OLLAMA_BATCH_SIZE:   int   = int(os.getenv("OLLAMA_BATCH_SIZE", "3"))
-
-# Jumlah retry per batch jika Ollama timeout atau JSON parse error
+# Default 3: qwen2.5:7b stabil dengan 3 item per batch
+OLLAMA_BATCH_SIZE:    int  = int(os.getenv("OLLAMA_BATCH_SIZE", "3"))
 OLLAMA_BATCH_RETRIES: int  = int(os.getenv("OLLAMA_BATCH_RETRIES", "1"))
 
+# [FIX-7] Tidak lagi filter is_whole_fruit di Python — NestJS yang filter
+# Hanya filter confidence rendah
 MIN_CONFIDENCE:      float = float(os.getenv("DB_MIN_CONFIDENCE", "0.5"))
 
 _VARIETY_ALIASES: Dict[str, str] = {
@@ -61,27 +69,56 @@ _VARIETY_ALIASES: Dict[str, str] = {
     "D2":   "Dato Nina / D2",
 }
 
+# Sinyal olahan yang harus membuat is_whole_fruit=false di sanitize
+_PROCESSED_SIGNALS = frozenset({
+    "kupas", "dikupas", "flesh", "pulp", "daging", "frozen", "beku",
+    "pancake", "biskuit", "kue", "cake", "pudding", "jelly", "extract",
+    "juice", "dodol", "lempok",
+})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Sanitasi output Ollama
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _sanitize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+def _sanitize_entry(
+    entry:      Dict[str, Any],
+    title_hint: str = "",
+) -> Dict[str, Any]:
     """
-    Pastikan semua field wajib NestJS ValidationPipe terisi dengan nilai
-    default yang aman. Dipanggil satu kali per entry setelah parsing Ollama.
+    Pastikan semua field wajib NestJS ValidationPipe terisi dengan nilai default.
 
-    [FIX-3] Logika weight_reference diperkuat:
-      - Rekonstruksi dari harga yang tersedia
-      - Pastikan tidak pernah None/empty setelah sanitasi
-      - Truncate aman (handle None)
-
-    [FIX-8] Semua string field: handle None sebelum [:N]
+    [FIX-3]  weight_reference: rekonstruksi dari konteks harga jika kosong.
+    [FIX-8]  Semua string field: handle None sebelum slicing.
+    [FIX-10] is_whole_fruit: default True jika fetcher sudah lolos filter
+             (karena fetcher _is_valid_item sudah memastikan buah utuh).
+             Override False hanya jika ada kata olahan di title_hint.
     """
+    # ── is_whole_fruit: [FIX-10] ────────────────────────────────────────────
+    iwf = entry.get("is_whole_fruit")
+    if not isinstance(iwf, bool):
+        iwf = bool(iwf) if iwf is not None else None
+
+    # Jika Ollama set False tapi title tidak mengandung sinyal olahan,
+    # kembalikan ke True karena fetcher sudah memvalidasi buah utuh
+    if iwf is False and title_hint:
+        t_lower = title_hint.lower()
+        has_processed = any(sig in t_lower for sig in _PROCESSED_SIGNALS)
+        if not has_processed:
+            # Override: fetcher sudah lolos filter, berarti ini buah utuh
+            iwf = True
+            logger.debug(
+                f"[DbSender][Sanitize] is_whole_fruit override True "
+                f"(tidak ada sinyal olahan): '{title_hint[:60]}'"
+            )
+
+    # Jika masih None setelah semua pengecekan, default True
+    # (fetcher hanya meloloskan buah utuh ke sini)
+    entry["is_whole_fruit"] = iwf if iwf is not None else True
+
     # ── weight_reference: @IsNotEmpty @IsString @MaxLength(200) ─────────────
     weight_ref = entry.get("weight_reference")
     if not isinstance(weight_ref, str) or not weight_ref.strip():
-        # Rekonstruksi dari konteks harga
         has_kg   = any(entry.get(k) is not None for k in
                        ("price_per_kg_min", "price_per_kg_max", "price_per_kg_avg"))
         has_unit = any(entry.get(k) is not None for k in
@@ -99,7 +136,7 @@ def _sanitize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     # ── variety_alias: @IsNotEmpty @IsString @MaxLength(100) ────────────────
     alias = entry.get("variety_alias")
     if not isinstance(alias, str) or not alias.strip():
-        entry["variety_alias"] = str(entry.get("variety_code", "unknown"))
+        entry["variety_alias"] = str(entry.get("variety_code", "unknown"))[:100]
     else:
         entry["variety_alias"] = alias[:100]
 
@@ -115,28 +152,23 @@ def _sanitize_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── notes: @IsOptional @IsString @MaxLength(500) ────────────────────────
     notes = entry.get("notes")
-    if notes is not None:
-        entry["notes"] = str(notes)[:500] if notes else None
+    entry["notes"] = str(notes)[:500] if notes is not None and notes else None
 
     # ── raw_text_snippet: @IsOptional @IsString @MaxLength(500) ─────────────
     snippet = entry.get("raw_text_snippet")
-    if snippet is not None:
-        entry["raw_text_snippet"] = str(snippet)[:500] if snippet else None
+    entry["raw_text_snippet"] = (
+        str(snippet)[:500] if snippet is not None and snippet else None
+    )
 
     # ── location_hint: @IsOptional @IsString @MaxLength(200) ────────────────
     loc = entry.get("location_hint")
-    if loc is not None:
-        entry["location_hint"] = str(loc)[:200] if loc else None
+    entry["location_hint"] = str(loc)[:200] if loc is not None and loc else None
 
     # ── seller_type: @IsOptional @IsString @MaxLength(100) ──────────────────
     seller = entry.get("seller_type")
-    if seller is not None:
-        entry["seller_type"] = str(seller)[:100] if seller else None
-
-    # ── is_whole_fruit: harus boolean ───────────────────────────────────────
-    iwf = entry.get("is_whole_fruit")
-    if not isinstance(iwf, bool):
-        entry["is_whole_fruit"] = bool(iwf) if iwf is not None else False
+    entry["seller_type"] = str(seller)[:100] if seller is not None and seller else None
+    
+    entry.pop("price_per_unit_avg", None)
 
     return entry
 
@@ -155,24 +187,38 @@ tidak ada blok ```json, tidak ada komentar.
 - Mulai langsung dengan karakter '[' dan akhiri dengan ']'.
 - Setiap elemen array sesuai SATU item input (urutan sama persis, jumlah sama persis).
 - Semua nilai harga dalam IDR (Rupiah), bilangan bulat tanpa titik/koma pemisah ribuan.
-- is_whole_fruit = true HANYA jika produk adalah buah utuh dengan kulit \
-(BUKAN daging/kupas/beku/pancake/bibit/olahan apapun).
-- Jika nilai tidak bisa ditentukan, gunakan null.
-- confidence (0.0–1.0): seberapa yakin kamu terhadap akurasi entri ini.
 - JANGAN potong atau ringkas output. Selesaikan semua elemen array.
+
+ATURAN is_whole_fruit (PENTING):
+- is_whole_fruit = true JIKA: buah utuh dengan kulit, atau listing jual "durian [kode/nama]" \
+yang jelas adalah buah utuh (meski tidak ada kata "utuh" eksplisit).
+- is_whole_fruit = false HANYA JIKA: produk jelas merupakan daging/kupas/beku/olahan \
+(pancake, dodol, extract, juice, biji, bibit, dll).
+- JIKA RAGU antara true/false untuk durian impor premium → pilih true.
+- Semua listing yang sudah lolos filter sistem (dikirim ke kamu) hampir pasti buah utuh.
 """
 
+# [FIX-9] Template prompt diperbaiki: tambah context variety untuk D13/D2
 _USER_PROMPT_TEMPLATE = """\
-Proses {count} listing durian varietas {variety_name} berikut.
+Proses {count} listing durian varietas {variety_name} ({variety_code}) berikut.
 Kembalikan JSON array dengan TEPAT {count} elemen. Mulai dengan '[', akhiri dengan ']'.
+
+KONTEKS VARIETAS:
+- Kode DOA Malaysia: {variety_code}
+- Nama umum: {variety_name}
+- Semua listing ini adalah hasil pencarian Google Shopping dengan query: "{query_used}"
+- Bahkan jika judul tidak menyebut "{variety_code}" atau "{variety_name}" secara eksplisit,
+  set variety_code = "{variety_code}" karena listing ini diambil dengan query spesifik tersebut.
+- is_whole_fruit: default true untuk listing ini (sudah difilter sistem sebagai buah utuh).
+  Set false HANYA jika ada kata olahan jelas (kupas, beku, pancake, daging, extract, dll).
 
 Schema SETIAP elemen (semua field wajib ada, gunakan null jika tidak tahu):
 {{
   "variety_code":       "{variety_code}",
   "variety_alias":      "<nama produk dari judul, max 100 karakter>",
-  "is_whole_fruit":     <true|false>,
-  "weight_reference":   "<WAJIB DIISI, min 4 karakter. Contoh: 'per buah 2-3 kg', 'per kg', 'per buah'. MAX 200 karakter>",
-  "notes":              "<catatan normalisasi harga atau null, max 500 karakter>",
+  "is_whole_fruit":     <true|false — DEFAULT true kecuali ada kata olahan>,
+  "weight_reference":   "<WAJIB DIISI min 4 karakter. Contoh: 'per buah 2-3 kg', 'per kg'>",
+  "notes":              "<catatan normalisasi atau null, max 500 karakter>",
   "price_per_kg_min":   <IDR integer atau null>,
   "price_per_kg_max":   <IDR integer atau null>,
   "price_per_kg_avg":   <IDR integer atau null>,
@@ -190,10 +236,13 @@ ATURAN NORMALISASI HARGA:
 price_per_kg_avg = round(price_idr / weight_kg_hint), tulis rumus di notes.
 - price_unit="per_buah" DAN weight_kg_hint null → \
 isi price_per_unit_min=price_idr, price_per_unit_max=price_idr, biarkan price_per_kg_* null.
-- price_unit="unknown"  → estimasi dari konteks judul. Durian premium ≈ 1.5–3 kg per buah.
+- price_unit="unknown"  → estimasi dari konteks. Durian premium ≈ 1.5–3 kg per buah.
+- Untuk {variety_code}: gunakan estimasi berat yang realistis jika tidak ada info berat.
+  D197 (Musang King): 1.5–2.5 kg/buah. D13 (Golden Bun): 2–3 kg/buah.
+  D24 (Sultan): 1.5–2.5 kg/buah. D2 (Dato Nina): 1.5–2.5 kg/buah.
 
-WAJIB: weight_reference harus diisi sesuai konteks:
-- Ada info berat di judul → salin verbatim (contoh: "per buah 2,2-2,3 kg")
+WAJIB: weight_reference diisi sesuai konteks:
+- Ada info berat di judul → salin verbatim
 - Harga per kg → "per kg"
 - Harga per buah tanpa info berat → "per buah"
 - Tidak ada info → "tidak diketahui"
@@ -206,14 +255,14 @@ INPUT ({count} item):
 async def _call_ollama(
     items:        List[Dict[str, Any]],
     variety_code: str,
+    query_used:   str,
     client:       httpx.AsyncClient,
     attempt:      int = 1,
 ) -> List[Dict[str, Any]]:
     """
     Kirim satu batch ke Ollama dan parse JSON array hasilnya.
-    Return list parsed entries, atau [] jika gagal.
-
-    [FIX-2] num_predict dinaikkan ke 4096 agar JSON tidak terpotong.
+    [FIX-2] num_predict=4096 agar JSON tidak terpotong.
+    [FIX-9] query_used dikirim ke prompt untuk context D13/D2.
     """
     variety_name = _VARIETY_ALIASES.get(variety_code, variety_code)
 
@@ -233,8 +282,17 @@ async def _call_ollama(
         count        = len(items),
         variety_name = variety_name,
         variety_code = variety_code,
+        query_used   = query_used,
         items_json   = json.dumps(compact_items, ensure_ascii=False, indent=2),
     )
+
+    # [FIX-OOM] num_predict adaptif berdasarkan jumlah item:
+    # 4096 terlalu besar untuk batch 3 item → Ollama 500 (OOM/VRAM habis).
+    # Formula: ~600 token per item + 512 overhead, cap di 3072 untuk keamanan.
+    # - 1 item  → ~1112 token
+    # - 2 item  → ~1712 token
+    # - 3 item  → ~2312 token
+    num_predict = min(512 + len(items) * 600, 3072)
 
     payload = {
         "model":  OLLAMA_MODEL,
@@ -244,9 +302,9 @@ async def _call_ollama(
             {"role": "user",   "content": user_prompt},
         ],
         "options": {
-            "temperature": 0.05,   # lebih deterministik untuk ekstraksi terstruktur
-            "num_predict": 4096,   # [FIX-2] cukup untuk 3 item × ~1000 token/item
-            "stop":        ["\n\n\n"],  # hentikan jika ada baris kosong berlebih
+            "temperature": 0.05,
+            "num_predict": num_predict,
+            "stop":        ["\n\n\n"],
         },
     }
 
@@ -267,7 +325,7 @@ async def _call_ollama(
                 line for line in lines if not line.strip().startswith("```")
             ).strip()
 
-        # Coba temukan JSON array jika ada teks sebelum/sesudahnya
+        # Cari JSON array
         if not raw_text.startswith("["):
             start = raw_text.find("[")
             if start != -1:
@@ -288,7 +346,6 @@ async def _call_ollama(
             )
             return []
 
-        # Validasi jumlah elemen
         if len(parsed) != len(items):
             logger.warning(
                 f"[DbSender][Ollama] {variety_code}: diharapkan {len(items)} elemen, "
@@ -327,18 +384,16 @@ async def _call_ollama(
 async def _normalize_variety(
     items:        List[Dict[str, Any]],
     variety_code: str,
+    query_used:   str,
     client:       httpx.AsyncClient,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Normalisasi semua item satu varietas via Ollama dengan batching.
 
-    [FIX-4] Retry 1x per batch jika gagal (timeout atau parse error).
-    [FIX-7] Hanya loloskan entry dengan is_whole_fruit=True ke NestJS,
-            karena NestJS MarketPriceValidator akan menolak is_whole_fruit=False
-            (hemat bandwidth & menghindari rejection log yang tidak perlu).
-
-    Returns:
-        (accepted_entries, parse_error_count)
+    [FIX-4]  Retry 1x per batch jika gagal.
+    [FIX-7]  DIHAPUS filter is_whole_fruit di Python — NestJS yang filter.
+             Python hanya filter confidence < MIN_CONFIDENCE.
+    [FIX-9]  query_used diteruskan ke _call_ollama untuk context prompt.
     """
     if not items:
         return [], 0
@@ -358,9 +413,10 @@ async def _normalize_variety(
     for idx, chunk in enumerate(chunks):
         parsed: List[Dict[str, Any]] = []
 
-        # [FIX-4] Retry loop
-        for attempt in range(1, OLLAMA_BATCH_RETRIES + 2):  # +2 = attempts = retries + 1
-            parsed = await _call_ollama(chunk, variety_code, client, attempt)
+        for attempt in range(1, OLLAMA_BATCH_RETRIES + 2):
+            parsed = await _call_ollama(
+                chunk, variety_code, query_used, client, attempt
+            )
             if parsed:
                 break
             if attempt <= OLLAMA_BATCH_RETRIES:
@@ -374,15 +430,14 @@ async def _normalize_variety(
         if not parsed:
             parse_errors += 1
         else:
-            for entry in parsed:
-                # [FIX-7] Filter is_whole_fruit=False SEBELUM kirim ke NestJS
-                is_whole = entry.get("is_whole_fruit")
-                if not is_whole:
-                    logger.debug(
-                        f"[DbSender] Skip non-whole-fruit: "
-                        f"{entry.get('variety_alias', '')[:60]}"
-                    )
+            for i, entry in enumerate(parsed):
+                # Pastikan variety_code selalu terisi (Ollama kadang skip)
+                if not isinstance(entry, dict):
+                    logger.warning(f"[DbSender] Ollama mengembalikan elemen non-dict: {type(entry)}")
                     continue
+                
+                if not entry.get("variety_code"):
+                    entry["variety_code"] = variety_code
 
                 confidence = entry.get("confidence", 0.0)
                 try:
@@ -398,8 +453,15 @@ async def _normalize_variety(
                     )
                     continue
 
+                # Ambil title hint dari item asli untuk sanitize is_whole_fruit
+                title_hint = chunk[i]["title"] if i < len(chunk) else ""
+                
+                if i < len(chunk):
+                    entry["source_name"] = chunk[i].get("source", "Unknown")
+                    entry["source_url"] = chunk[i].get("source_url", "")
+
                 # Sanitasi dipanggil sekali di sini
-                all_entries.append(_sanitize_entry(entry))
+                all_entries.append(_sanitize_entry(entry, title_hint))
 
         logger.info(
             f"[DbSender] {variety_code} batch {idx+1}/{len(chunks)}: "
@@ -441,9 +503,8 @@ async def _post_to_nestjs(
     """
     Serialisasi payload → HMAC sign → POST ke NestJS.
 
-    KRITIS: body HARUS di-serialize compact (separators=(",",":")) tanpa spasi,
-    karena NestJS HmacSignatureGuard membaca rawBody Buffer untuk verifikasi.
-    Perbedaan whitespace sekecil apapun akan membuat signature tidak cocok.
+    KRITIS: body HARUS di-serialize compact (separators=(",",":")) karena
+    NestJS HmacSignatureGuard membaca rawBody Buffer untuk verifikasi.
     """
     if not NESTJS_INTERNAL_KEY:
         logger.error(
@@ -471,6 +532,8 @@ async def _post_to_nestjs(
         f"{len(body_bytes)} bytes | "
         f"{entry_count} entries"
     )
+    # Log signature prefix untuk debug HMAC mismatch
+    logger.debug(f"[DbSender] Signature: {signature[:20]}...")
 
     try:
         resp = await client.post(
@@ -519,13 +582,6 @@ async def send_run_to_db(
 ) -> Dict[str, Any]:
     """
     Entry point utama dari task.py Tahap 3.
-
-    Args:
-        summary : Dict run_summary yang sudah disimpan oleh storage.save_summary()
-        results : List hasil per varietas dari fetcher.fetch_all()
-
-    Returns:
-        Dict: {success, listings_inserted, listings_rejected, llm_errors, error}
     """
     run_id        = summary.get("run_id", "unknown")
     agent_version = os.getenv("APP_VERSION", "1.0.0")
@@ -538,7 +594,6 @@ async def send_run_to_db(
     }
     nestjs_status = _status_map.get(run_status, "no_data")
 
-    # Varietas yang punya item valid
     valid_varieties = [r for r in results if r.get("success") and r.get("items")]
 
     if not valid_varieties:
@@ -560,11 +615,14 @@ async def send_run_to_db(
         for vr in valid_varieties:
             variety_code = vr["variety_code"]
             items        = vr.get("items", [])
+            query_used   = vr.get("query_used", "")
 
             logger.info(f"[DbSender] Normalisasi {variety_code} ({len(items)} item)...")
 
             try:
-                entries, errs = await _normalize_variety(items, variety_code, client)
+                entries, errs = await _normalize_variety(
+                    items, variety_code, query_used, client
+                )
                 all_entries.extend(entries)
                 total_llm_errors += errs
                 logger.info(
@@ -586,10 +644,26 @@ async def send_run_to_db(
         empty_status = "llm_error" if total_llm_errors > 0 else "no_data"
         return await _send_empty_report(run_id, agent_version, empty_status, summary)
 
-    # Hitung statistik ringkasan
     sources_scraped   = sum(r.get("item_count", 0) for r in results)
     sources_failed    = sum(1 for r in results if not r.get("success"))
     entries_discarded = max(0, sources_scraped - len(all_entries))
+
+    # Defensive check: pastikan tidak ada weight_reference kosong
+    pre_check_errors: List[str] = []
+    for i, entry in enumerate(all_entries):
+        wr = entry.get("weight_reference")
+        if not wr or not isinstance(wr, str) or not wr.strip():
+            pre_check_errors.append(
+                f"entries[{i}] variety={entry.get('variety_code')} "
+                f"alias='{entry.get('variety_alias', '')[:40]}'"
+            )
+            entry["weight_reference"] = "per buah"
+
+    if pre_check_errors:
+        logger.warning(
+            f"[DbSender] Pre-check: {len(pre_check_errors)} entry "
+            f"weight_reference kosong — di-patch:\n" + "\n".join(pre_check_errors)
+        )
 
     market_report: Dict[str, Any] = {
         "agent_version":     agent_version,
@@ -604,27 +678,6 @@ async def send_run_to_db(
         "entries_discarded": entries_discarded,
         "error_details":     None,
     }
-
-    # Validasi pra-kirim: pastikan tidak ada weight_reference kosong
-    # (defensive check sebelum POST, sebagai lapisan ke-2 setelah _sanitize_entry)
-    pre_check_errors: List[str] = []
-    for i, entry in enumerate(all_entries):
-        wr = entry.get("weight_reference")
-        if not wr or not isinstance(wr, str) or not wr.strip():
-            pre_check_errors.append(
-                f"entries[{i}] variety={entry.get('variety_code')} "
-                f"alias='{entry.get('variety_alias', '')[:40]}': "
-                f"weight_reference kosong setelah sanitasi!"
-            )
-            # Force-set fallback terakhir
-            entry["weight_reference"] = "per buah"
-
-    if pre_check_errors:
-        logger.warning(
-            f"[DbSender] Pre-check menemukan {len(pre_check_errors)} "
-            f"entry dengan weight_reference kosong — sudah di-patch:\n"
-            + "\n".join(pre_check_errors)
-        )
 
     logger.info(
         f"[DbSender] Kirim ke NestJS: "
@@ -649,10 +702,6 @@ async def _send_empty_report(
     status:        str,
     summary:       Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Kirim laporan kosong ke NestJS supaya run tetap tercatat
-    di log server meski tidak ada data yang disimpan.
-    """
     market_report: Dict[str, Any] = {
         "agent_version":     agent_version,
         "run_id":            run_id,
