@@ -1,20 +1,15 @@
 # agent/queries.py
 #
-# Definisi target pencarian Google Shopping per varietas durian.
-# Query dirancang untuk mendapatkan BUAH UTUH BERKULIT saja.
-#
-# Strategi filter:
-#   - D197/D24: Normal mode — nama varietas WAJIB ada di judul.
-#   - D13/D2  : Relaxed mode — nama varietas OR sinyal buah utuh cukup,
-#               TAPI tetap harus ada kata "durian" di judul.
-#               Catatan: relaxed mode menerima listing yang tidak label varietas
-#               (seller lokal sering tidak tulis "D13" atau "Dato Nina").
-#
-# PENTING perubahan v3:
-#   - D2: relaxed_variety_check=False sekarang — D2 sangat langka dan query
-#     relaxed menghasilkan item salah varietas (musang king muncul).
-#     Lebih baik dapat 0 item yang benar daripada data yang salah.
-#   - D13: relaxed_variety_check=True dipertahankan tapi keyword_extras diperkuat.
+# Perubahan dari versi sebelumnya:
+#   D2 Dato Nina:
+#   - Query diubah dari "dato nina" (nama tidak dikenal di Indonesia)
+#     ke kombinasi "durian d2 + malaysia/impor/fresh" yang lebih realistis.
+#   - variety_keyword_extras diperluas: tambah "durian d2" dan "d 2" (dengan spasi)
+#     karena listing di marketplace sering tulis "D 2" bukan "D2".
+#   - relaxed_variety_check tetap False — lebih baik 0 data benar
+#     daripada data salah varietas.
+#   - min_results diturunkan ke 1 agar run tidak dianggap gagal
+#     hanya karena D2 memang langka.
 
 from __future__ import annotations
 
@@ -24,26 +19,6 @@ from typing import Dict, FrozenSet, List, Optional
 
 @dataclass(frozen=True)
 class DurianQuery:
-    """
-    Satu target pencarian Google Shopping untuk satu varietas durian.
-
-    Attributes:
-        variety_code          : Kode identifikasi varietas (D2/D13/D24/D197).
-        variety_name          : Nama lengkap untuk logging dan output JSON.
-        search_queries        : Daftar query dicoba berurutan. Pertama = utama;
-                               berikutnya = fallback.
-        variety_keyword_extras: Keyword tambahan yang boleh lolos filter varietas
-                               (selain _VARIETY_KEYWORDS utama di fetcher).
-        min_results           : Batas minimum item lolos filter agar query
-                               dianggap cukup.
-        num_results           : Jumlah hasil yang diminta ke SerpApi (max 100).
-        gl                    : Google country code.
-        hl                    : Google language code.
-        relaxed_variety_check : Jika True, fetcher tidak wajibkan nama varietas
-                               ada di judul — cukup lolos sinyal buah utuh.
-                               Gunakan HANYA untuk varietas yang benar-benar langka
-                               DAN query sudah sangat spesifik.
-    """
     variety_code:           str
     variety_name:           str
     search_queries:         List[str]
@@ -65,8 +40,6 @@ class DurianQuery:
             raise ValueError("num_results harus 1–100.")
 
 
-# ── 4 Varietas Target ─────────────────────────────────────────────────────────
-
 DURIAN_QUERIES: List[DurianQuery] = [
 
     # ── D197 Musang King ──────────────────────────────────────────────────────
@@ -87,8 +60,6 @@ DURIAN_QUERIES: List[DurianQuery] = [
     ),
 
     # ── D13 Golden Bun ────────────────────────────────────────────────────────
-    # relaxed=True karena seller Indonesia jarang label "D13" / "Golden Bun"
-    # tapi query sudah sangat spesifik sehingga hasil tetap relevan.
     DurianQuery(
         variety_code = "D13",
         variety_name = "Golden Bun",
@@ -124,27 +95,37 @@ DURIAN_QUERIES: List[DurianQuery] = [
         relaxed_variety_check = False,
     ),
 
-    # ── D2 Dato Nina ─────────────────────────────────────────────────────────
-    # PENTING: relaxed_variety_check=False karena query relaxed menghasilkan
-    # item salah varietas (misalnya Musang King muncul dengan query "durian datuk nina").
-    # Lebih baik 0 item benar daripada data salah variety_code.
-    # Jika ingin relaxed, ubah kembali ke True DAN tambah validasi di fetcher.
+    # ── D2 Dato Nina ──────────────────────────────────────────────────────────
+    #
+    # Nama "Dato Nina" / "Datuk Nina" hampir tidak pernah dipakai di listing
+    # marketplace Indonesia. Varietas ini lebih dikenal dengan kode "D2" saja,
+    # sering digabung dengan kata "malaysia" atau "impor".
+    #
+    # Strategi baru:
+    #   - Query menggunakan "d2" + konteks (malaysia, impor, utuh) agar
+    #     tidak menangkap produk lain yang kebetulan ada huruf "d2".
+    #   - variety_keyword_extras mencakup semua varian penulisan umum.
+    #   - relaxed_variety_check=False tetap dipertahankan: filter di fetcher
+    #     wajib menemukan keyword "d2" (bersama "durian") di judul.
+    #   - min_results=1: jika tidak ada data memang tidak ada, run tidak gagal.
     DurianQuery(
         variety_code = "D2",
-        variety_name = "Dato Nina",
+        variety_name = "Dato Nina / D2",
         search_queries = [
-            "durian dato nina utuh segar",
-            "durian dato nina d2 buah",
-            "durian d2 dato nina impor",
-            "jual durian datuk nina segar",
-            "durian dato nina fresh malaysia",
+            "durian d2 malaysia utuh segar",       # paling spesifik
+            "durian d2 impor buah utuh",
+            "jual durian d2 fresh malaysia",
+            "durian d2 buah segar berkulit",
+            "durian dato nina d2 utuh",            # tetap coba nama asli sebagai fallback
         ],
         variety_keyword_extras = frozenset({
-            "dato nina", "datuk nina", "dato nena", "durian d2",
+            "dato nina", "datuk nina", "dato nena",
+            "durian d2",
+            "d 2",          # penulisan dengan spasi: "D 2"
         }),
         min_results = 1,
         num_results = 60,
-        relaxed_variety_check = False,  # Ketat: WAJIB ada nama varietas di judul
+        relaxed_variety_check = False,  # wajib ada "d2" + "durian" di judul
     ),
 
 ]
